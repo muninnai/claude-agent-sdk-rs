@@ -77,6 +77,17 @@ pub struct ClaudeAgentOptions {
     /// Environment variables
     #[builder(default)]
     pub env: HashMap<String, String>,
+    /// Clear the inherited environment before applying [`Self::env`].
+    ///
+    /// Defaults to `false`, which is the existing behavior: `env` is overlaid on
+    /// whatever the parent process happens to hold. That overlay can add and
+    /// replace variables but cannot remove one, so a caller that has already
+    /// computed a complete environment has no way to say "and nothing else".
+    ///
+    /// Set this when `env` is the child's whole intended environment rather than
+    /// a patch on the parent's.
+    #[builder(default)]
+    pub env_clear: bool,
     /// Extra CLI arguments
     #[builder(default)]
     pub extra_args: HashMap<String, Option<String>>,
@@ -485,6 +496,22 @@ pub struct SandboxSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_env_clear_defaults_to_false() {
+        let options = ClaudeAgentOptions::builder().build();
+        assert!(
+            !options.env_clear,
+            "env_clear must default to false so existing callers keep \
+             inheriting the parent environment"
+        );
+    }
+
+    #[test]
+    fn test_env_clear_can_be_enabled() {
+        let options = ClaudeAgentOptions::builder().env_clear(true).build();
+        assert!(options.env_clear);
+    }
 
     #[test]
     fn test_tools_from_str_array() {

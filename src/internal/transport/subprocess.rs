@@ -673,8 +673,9 @@ impl Transport for SubprocessTransport {
         cmd.args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .envs(&env);
+            .stderr(Stdio::piped());
+
+        apply_environment(&mut cmd, self.options.env_clear, &env);
 
         if let Some(ref cwd) = self.cwd {
             cmd.current_dir(cwd);
@@ -883,5 +884,45 @@ impl Drop for SubprocessTransport {
         {
             let _ = process.start_kill();
         }
+    }
+}
+
+/// Apply the child environment to `cmd`, honoring `env_clear`.
+///
+/// The single owner of that ordering: clearing must happen *before* `envs`, or
+/// it would discard the caller-supplied entries along with the inherited ones.
+fn apply_environment(cmd: &mut Command, env_clear: bool, env: &HashMap<String, String>) {
+    if env_clear {
+        cmd.env_clear();
+    }
+    cmd.envs(env);
+}
+
+#[cfg(test)]
+mod apply_environment_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_env_clear_drops_preconfigured_entries_but_keeps_supplied_ones() {
+        // Set on the command rather than on this process, so the test mutates no
+        // global state and needs no unsafe.
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.env("SDK_ENV_CLEAR_SENTINEL", "inherited");
+
+        let env = HashMap::from([("SDK_ENV_CLEAR_KEPT".to_string(), "kept".to_string())]);
+        apply_environment(&mut cmd, true, &env);
+
+        let output = cmd.output().await.expect("run /usr/bin/env");
+        let child_env = String::from_utf8_lossy(&output.stdout);
+
+        assert!(
+            child_env.contains("SDK_ENV_CLEAR_KEPT=kept"),
+            "the supplied entry must survive env_clear; got: {child_env}"
+        );
+        assert!(
+            !child_env.contains("SDK_ENV_CLEAR_SENTINEL"),
+            "an entry configured before env_clear must not reach the child; got: {child_env}"
+        );
     }
 }
