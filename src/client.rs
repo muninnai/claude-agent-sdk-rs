@@ -7,12 +7,13 @@ use std::sync::Arc;
 
 use crate::errors::{ClaudeError, Result};
 use crate::internal::message_parser::MessageParser;
-use crate::internal::query_full::QueryFull;
+use crate::internal::query_full::{InterruptQueryError, QueryFull};
 use crate::internal::transport::subprocess::QueryPrompt;
 use crate::internal::transport::{SubprocessTransport, Transport};
 use crate::types::config::{ClaudeAgentOptions, PermissionMode};
 use crate::types::efficiency::{build_efficiency_hooks, merge_hooks};
 use crate::types::hooks::{HookEvent, HookMatcher};
+use crate::types::interrupt::{InterruptError, InterruptRequestAccepted};
 use crate::types::mcp::McpSdkServerConfig;
 use crate::types::messages::{Message, UserContentBlock};
 
@@ -683,19 +684,39 @@ impl ClaudeClient {
         })
     }
 
-    /// Send an interrupt signal to stop the current Claude operation
+    /// Send an interrupt request to Claude Code and report its outcome.
     ///
     /// This is analogous to Python's `client.interrupt()`.
     ///
+    /// Returning [`InterruptRequestAccepted`] means Claude Code accepted the
+    /// *request*. It does not mean a turn stopped, and it does not mean a turn
+    /// was running: an interrupt sent during an active turn and one sent while
+    /// nothing is running receive the same success envelope, and they differ
+    /// only afterwards on the message stream. Callers wanting evidence that a
+    /// turn was actually interrupted must read that stream.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the client is not connected or if sending fails.
-    pub async fn interrupt(&self) -> Result<()> {
-        let query = self.query.as_ref().ok_or_else(|| {
-            ClaudeError::InvalidConfig("Client not connected. Call connect() first.".to_string())
-        })?;
+    /// Returns [`InterruptError`] when the client holds no query, the request
+    /// could not be written, Claude Code answered with an error envelope, the
+    /// response reader exited before answering, or a correlated response
+    /// arrived that could not be interpreted. No variant claims that a turn was
+    /// or was not stopped.
+    pub async fn interrupt(&self) -> std::result::Result<InterruptRequestAccepted, InterruptError> {
+        let query = self.query.as_ref().ok_or(InterruptError::NotConnected)?;
 
-        query.interrupt().await
+        query.interrupt().await.map_err(|error| match error {
+            InterruptQueryError::SendFailed { source } => InterruptError::SendFailed { source },
+            InterruptQueryError::ErrorResponse { message } => {
+                InterruptError::ErrorResponse { message }
+            }
+            InterruptQueryError::AcknowledgementUnavailable => {
+                InterruptError::AcknowledgementUnavailable
+            }
+            InterruptQueryError::UnexpectedResponse { subtype } => {
+                InterruptError::UnexpectedResponse { subtype }
+            }
+        })
     }
 
     /// Change the permission mode dynamically

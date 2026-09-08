@@ -7,7 +7,10 @@ use claude_agent_sdk_rs::testing::{
     AssistantMessageBuilder, MockClient, MockTransport, ResultMessageBuilder, ScenarioBuilder,
     SystemMessageBuilder, Transport, timing_profiles,
 };
-use claude_agent_sdk_rs::{ClaudeAgentOptions, ClaudeClient, Message, PermissionMode};
+use claude_agent_sdk_rs::{
+    ClaudeAgentOptions, ClaudeClient, ClaudeError, InterruptError, InterruptRequestAccepted,
+    Message, PermissionMode,
+};
 use futures::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -867,4 +870,441 @@ async fn test_set_permission_mode_invalid_mode_value_returns_error() {
         err_msg.contains("invalid mode"),
         "Error should mention invalid mode, got: {err_msg}"
     );
+}
+
+// =============================================================================
+// interrupt Outcome Tests
+// =============================================================================
+
+/// Watches for an `interrupt` control request in transport writes, extracts the
+/// request_id, and injects a control_response built from the given envelope
+/// fields.
+///
+/// `envelope_fields` is merged into the `response` object *beside* the
+/// request_id, so a test controls the discriminator and the payload
+/// independently — including omitting `subtype` or supplying one the fold
+/// cannot interpret.
+fn spawn_interrupt_response_watcher(
+    transport: Arc<MockTransport>,
+    envelope_fields: serde_json::Value,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut seen = 0;
+        loop {
+            let written = transport.written_messages_async().await;
+            for i in seen..written.len() {
+                if let Some(ref parsed) = written[i].parsed {
+                    if parsed.get("type").and_then(|v| v.as_str()) == Some("control_request")
+                        && parsed.pointer("/request/subtype").and_then(|v| v.as_str())
+                            == Some("interrupt")
+                    {
+                        let request_id = parsed["request_id"].as_str().unwrap();
+                        let mut response = serde_json::json!({
+                            "type": "control_response",
+                            "response": {
+                                "request_id": request_id,
+                            }
+                        });
+                        if let Some(resp_obj) = response["response"].as_object_mut() {
+                            if let Some(body_obj) = envelope_fields.as_object() {
+                                for (k, v) in body_obj {
+                                    resp_obj.insert(k.clone(), v.clone());
+                                }
+                            }
+                        }
+                        transport.inject(response);
+                        return;
+                    }
+                }
+            }
+            seen = written.len();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+}
+
+/// Drive one interrupt against a mock transport that answers with
+/// `envelope_fields`, and hand back the outcome.
+async fn interrupt_against_envelope(
+    envelope_fields: serde_json::Value,
+) -> std::result::Result<InterruptRequestAccepted, InterruptError> {
+    let transport = Arc::new(MockTransport::builder().build());
+
+    let _watcher = spawn_interrupt_response_watcher(Arc::clone(&transport), envelope_fields);
+
+    let mut client = ClaudeClient::with_transport(
+        Arc::clone(&transport) as Arc<dyn Transport>,
+        ClaudeAgentOptions::default(),
+    );
+    client.connect_with_transport().await.unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(5), client.interrupt())
+        .await
+        .expect("should not timeout");
+
+    client.disconnect().await.unwrap();
+    result
+}
+
+#[tokio::test]
+async fn test_interrupt_success_with_receipt_preserves_still_queued() {
+    let result = interrupt_against_envelope(serde_json::json!({
+        "subtype": "success",
+        "response": {"still_queued": ["uuid-a", "uuid-b"]},
+    }))
+    .await;
+
+    assert_eq!(
+        result.unwrap(),
+        InterruptRequestAccepted {
+            still_queued: Some(vec!["uuid-a".to_string(), "uuid-b".to_string()]),
+        }
+    );
+}
+
+#[tokio::test]
+async fn test_interrupt_success_with_empty_receipt_is_some_empty() {
+    // `Some(vec![])` and `None` are different claims: an empty list is a
+    // receipt reporting no covered queued survivor, while `None` means no
+    // usable receipt was recovered at all.
+    let result = interrupt_against_envelope(serde_json::json!({
+        "subtype": "success",
+        "response": {"still_queued": []},
+    }))
+    .await;
+
+    assert_eq!(
+        result.unwrap(),
+        InterruptRequestAccepted {
+            still_queued: Some(vec![]),
+        }
+    );
+}
+
+#[tokio::test]
+async fn test_interrupt_success_without_payload_is_accepted() {
+    // Acceptance is strict on the envelope and permissive on its payload:
+    // older CLIs answer with no `response` object at all.
+    let result = interrupt_against_envelope(serde_json::json!({"subtype": "success"})).await;
+
+    assert_eq!(
+        result.unwrap(),
+        InterruptRequestAccepted { still_queued: None }
+    );
+}
+
+#[tokio::test]
+async fn test_interrupt_success_with_null_payload_is_accepted() {
+    let result = interrupt_against_envelope(serde_json::json!({
+        "subtype": "success",
+        "response": serde_json::Value::Null,
+    }))
+    .await;
+
+    assert_eq!(
+        result.unwrap(),
+        InterruptRequestAccepted { still_queued: None }
+    );
+}
+
+#[tokio::test]
+async fn test_interrupt_success_with_unknown_payload_fields_is_accepted() {
+    let result = interrupt_against_envelope(serde_json::json!({
+        "subtype": "success",
+        "response": {"some_future_field": 7},
+    }))
+    .await;
+
+    assert_eq!(
+        result.unwrap(),
+        InterruptRequestAccepted { still_queued: None }
+    );
+}
+
+#[tokio::test]
+async fn test_interrupt_mixed_receipt_array_yields_no_receipt() {
+    // All-or-nothing parsing. Dropping the non-string element would report a
+    // shorter survivor list as though it were the whole one.
+    let result = interrupt_against_envelope(serde_json::json!({
+        "subtype": "success",
+        "response": {"still_queued": ["uuid-a", 7, "uuid-b"]},
+    }))
+    .await;
+
+    assert_eq!(
+        result.unwrap(),
+        InterruptRequestAccepted { still_queued: None },
+        "a mixed array must yield no receipt, never a filtered partial one"
+    );
+}
+
+#[tokio::test]
+async fn test_interrupt_receipt_that_is_not_an_array_yields_no_receipt() {
+    let result = interrupt_against_envelope(serde_json::json!({
+        "subtype": "success",
+        "response": {"still_queued": "uuid-a"},
+    }))
+    .await;
+
+    assert_eq!(
+        result.unwrap(),
+        InterruptRequestAccepted { still_queued: None }
+    );
+}
+
+#[tokio::test]
+async fn test_interrupt_error_envelope_reports_the_error_response() {
+    let result = interrupt_against_envelope(serde_json::json!({
+        "subtype": "error",
+        "error": "interrupt rejected",
+    }))
+    .await;
+
+    match result.unwrap_err() {
+        InterruptError::ErrorResponse { message } => assert_eq!(message, "interrupt rejected"),
+        other => panic!("expected ErrorResponse, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_interrupt_error_envelope_without_message_is_unusable() {
+    // An `error` discriminator whose `error` field is absent cannot be reported
+    // as an error response, because there is no message the wire supplied.
+    let result = interrupt_against_envelope(serde_json::json!({"subtype": "error"})).await;
+
+    match result.unwrap_err() {
+        InterruptError::UnexpectedResponse { subtype } => assert_eq!(subtype, "error"),
+        other => panic!("expected UnexpectedResponse, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_interrupt_error_envelope_with_non_string_message_is_unusable() {
+    let result = interrupt_against_envelope(serde_json::json!({
+        "subtype": "error",
+        "error": {"code": 7},
+    }))
+    .await;
+
+    match result.unwrap_err() {
+        InterruptError::UnexpectedResponse { subtype } => assert_eq!(subtype, "error"),
+        other => panic!("expected UnexpectedResponse, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_interrupt_unknown_subtype_is_unusable() {
+    // The fold is total: a correlated response carrying neither `success` nor
+    // `error` is reported as unusable rather than guessed in either direction.
+    let result = interrupt_against_envelope(serde_json::json!({
+        "subtype": "set_permission_mode",
+        "response": {"mode": "default"},
+    }))
+    .await;
+
+    match result.unwrap_err() {
+        InterruptError::UnexpectedResponse { subtype } => {
+            assert_eq!(subtype, "set_permission_mode")
+        }
+        other => panic!("expected UnexpectedResponse, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_interrupt_before_connecting_reports_not_connected() {
+    // The precondition is observable only here, above the query boundary.
+    let transport = Arc::new(MockTransport::builder().build());
+    let client = ClaudeClient::with_transport(
+        Arc::clone(&transport) as Arc<dyn Transport>,
+        ClaudeAgentOptions::default(),
+    );
+
+    match client.interrupt().await.unwrap_err() {
+        InterruptError::NotConnected => {}
+        other => panic!("expected NotConnected, got {other:?}"),
+    }
+
+    assert!(
+        transport.written_messages().is_empty(),
+        "a disconnected interrupt must not reach the transport"
+    );
+}
+
+#[tokio::test]
+async fn test_interrupt_reader_exit_releases_a_waiting_request() {
+    // Half one of the registration race: the waiter is already registered when
+    // the reader exits, so the reader's release sweep is what resolves it.
+    // Closing the transport ends the read stream cleanly, with no stream error
+    // — the exact path that used to hang forever.
+    let transport = Arc::new(MockTransport::builder().build());
+
+    let closer = {
+        let transport = Arc::clone(&transport);
+        tokio::spawn(async move {
+            loop {
+                let written = transport.written_messages_async().await;
+                if written.iter().any(|message| {
+                    message.parsed.as_ref().is_some_and(|parsed| {
+                        parsed.pointer("/request/subtype").and_then(|v| v.as_str())
+                            == Some("interrupt")
+                    })
+                }) {
+                    transport.close().await.unwrap();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    };
+
+    let mut client = ClaudeClient::with_transport(
+        Arc::clone(&transport) as Arc<dyn Transport>,
+        ClaudeAgentOptions::default(),
+    );
+    client.connect_with_transport().await.unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(5), client.interrupt())
+        .await
+        .expect("a reader exit must release the waiter rather than hang");
+
+    closer.await.unwrap();
+
+    match result.unwrap_err() {
+        InterruptError::AcknowledgementUnavailable => {}
+        other => panic!("expected AcknowledgementUnavailable, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_interrupt_registered_after_reader_exit_reports_no_acknowledgement() {
+    // Half two of the registration race, made deterministic by ordering: the
+    // first interrupt returns only once the reader has exited, so the second
+    // one necessarily registers *after* the release sweep and can only be
+    // resolved by the exit flag it checks for itself.
+    //
+    // The assertion is sharp rather than tautological. Once the transport is
+    // closed its `write` fails, so a second interrupt that reached the write
+    // would report `SendFailed`. `AcknowledgementUnavailable` is therefore
+    // reachable only by withdrawing at registration, before the write.
+    let transport = Arc::new(MockTransport::builder().build());
+
+    let closer = {
+        let transport = Arc::clone(&transport);
+        tokio::spawn(async move {
+            loop {
+                let written = transport.written_messages_async().await;
+                if written.iter().any(|message| {
+                    message.parsed.as_ref().is_some_and(|parsed| {
+                        parsed.pointer("/request/subtype").and_then(|v| v.as_str())
+                            == Some("interrupt")
+                    })
+                }) {
+                    transport.close().await.unwrap();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    };
+
+    let mut client = ClaudeClient::with_transport(
+        Arc::clone(&transport) as Arc<dyn Transport>,
+        ClaudeAgentOptions::default(),
+    );
+    client.connect_with_transport().await.unwrap();
+
+    let first = tokio::time::timeout(Duration::from_secs(5), client.interrupt())
+        .await
+        .expect("the first interrupt must be released by the reader exit");
+    closer.await.unwrap();
+    match first.unwrap_err() {
+        InterruptError::AcknowledgementUnavailable => {}
+        other => panic!(
+            "expected the first interrupt to report AcknowledgementUnavailable, got {other:?}"
+        ),
+    }
+
+    let writes_before = transport.written_messages().len();
+
+    let second = tokio::time::timeout(Duration::from_secs(5), client.interrupt())
+        .await
+        .expect("a post-exit registration must not hang");
+
+    match second.unwrap_err() {
+        InterruptError::AcknowledgementUnavailable => {}
+        other => panic!(
+            "expected AcknowledgementUnavailable from the post-exit registration, got {other:?}"
+        ),
+    }
+
+    assert_eq!(
+        transport.written_messages().len(),
+        writes_before,
+        "the post-exit registration must withdraw before writing"
+    );
+}
+
+/// A transport whose writes always fail and whose read stream never ends.
+///
+/// The reader task therefore stays alive, so the exit flag stays clear and the
+/// write failure is the only outcome the interrupt path can reach. `MockTransport`
+/// cannot isolate this site: its only write failure is the post-`close()` one,
+/// and closing also ends the read stream, so which of the two failures wins
+/// would be a race with the reader's exit rather than a fixed outcome.
+struct WriteFailingTransport;
+
+#[async_trait::async_trait]
+impl Transport for WriteFailingTransport {
+    async fn connect(&self) -> claude_agent_sdk_rs::Result<()> {
+        Ok(())
+    }
+
+    async fn write(&self, _data: &str) -> claude_agent_sdk_rs::Result<()> {
+        Err(ClaudeError::Transport("stdin is unavailable".to_string()))
+    }
+
+    fn read_messages(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn futures::Stream<Item = claude_agent_sdk_rs::Result<serde_json::Value>> + Send + '_>,
+    > {
+        Box::pin(futures::stream::pending())
+    }
+
+    async fn close(&self) -> claude_agent_sdk_rs::Result<()> {
+        Ok(())
+    }
+
+    fn is_ready(&self) -> bool {
+        true
+    }
+
+    async fn end_input(&self) -> claude_agent_sdk_rs::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_interrupt_write_failure_reports_send_failed() {
+    // `SendFailed` keeps the transport error whole and claims nothing about
+    // delivery: body, newline, and flush are separately fallible.
+    let mut client = ClaudeClient::with_transport(
+        Arc::new(WriteFailingTransport) as Arc<dyn Transport>,
+        ClaudeAgentOptions::default(),
+    );
+    client.connect_with_transport().await.unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(5), client.interrupt())
+        .await
+        .expect("should not timeout");
+
+    match result.unwrap_err() {
+        InterruptError::SendFailed { source } => {
+            assert!(
+                source.to_string().contains("stdin is unavailable"),
+                "the transport error must be preserved whole, got: {source}"
+            );
+        }
+        other => panic!("expected SendFailed, got {other:?}"),
+    }
 }

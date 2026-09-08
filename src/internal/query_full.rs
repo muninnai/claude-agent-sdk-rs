@@ -6,11 +6,12 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::oneshot;
 
 use crate::errors::{ClaudeError, Result};
 use crate::types::hooks::{HookCallback, HookContext, HookInput, HookMatcher};
+use crate::types::interrupt::InterruptRequestAccepted;
 use crate::types::mcp::McpSdkServerConfig;
 use crate::types::permissions::{CanUseToolCallback, PermissionResult, ToolPermissionContext};
 
@@ -37,11 +38,62 @@ struct ControlResponse {
 
 #[derive(Debug, serde::Deserialize)]
 struct ControlResponseData {
-    #[allow(dead_code)]
     subtype: String,
     request_id: String,
     #[serde(flatten)]
     data: serde_json::Value,
+}
+
+/// A correlated control response as handed to the waiter.
+///
+/// Carries the discriminator beside the complete flattened remainder that
+/// callers already receive, so no sibling key is lost. Only `interrupt()`
+/// interprets `subtype`; the generic helper continues to return `data` alone.
+#[derive(Debug)]
+struct RoutedControlResponse {
+    subtype: String,
+    data: serde_json::Value,
+}
+
+/// Why a routed control request produced no correlated response.
+///
+/// `Write` keeps the transport failure whole; delivery is indeterminate,
+/// because the body, the newline, and the flush are separately fallible.
+/// `NoAcknowledgement` means the waiter was released without an answer.
+#[derive(Debug)]
+enum RoutedSendFailure {
+    Write(ClaudeError),
+    NoAcknowledgement,
+}
+
+/// Failure of an interrupt request at the private query boundary.
+///
+/// The missing-query precondition is unrepresentable here: it can only be
+/// observed by the public client before a query exists.
+#[derive(Debug)]
+pub(crate) enum InterruptQueryError {
+    SendFailed { source: ClaudeError },
+    ErrorResponse { message: String },
+    AcknowledgementUnavailable,
+    UnexpectedResponse { subtype: String },
+}
+
+/// Read the optional `still_queued` receipt out of a success payload.
+///
+/// `data` is the flattened remainder of the response object, so the receipt
+/// sits under the nested `response` key. Returns `None` when the field is
+/// absent, null, or not an array of strings.
+///
+/// Parsing is all-or-nothing: a mixed array yields `None`, never a partial
+/// receipt. Dropping the non-string elements would report a *shorter* survivor
+/// list as though it were the whole one, which is a stronger claim than the
+/// wire supports. `None` never means the acknowledgement was missing.
+fn parse_still_queued(data: &serde_json::Value) -> Option<Vec<String>> {
+    data.pointer("/response/still_queued")?
+        .as_array()?
+        .iter()
+        .map(|item| item.as_str().map(str::to_string))
+        .collect()
 }
 
 /// Control request from CLI to SDK
@@ -67,13 +119,19 @@ pub struct QueryFull {
     next_callback_id: Arc<AtomicU64>,
     request_counter: Arc<AtomicU64>,
     /// Pending control request responses - concurrent access via DashMap
-    pending_responses: Arc<DashMap<String, oneshot::Sender<serde_json::Value>>>,
+    pending_responses: Arc<DashMap<String, oneshot::Sender<RoutedControlResponse>>>,
     /// Message sender - Option so start() can take ownership via .take()
     message_tx: Option<flume::Sender<serde_json::Value>>,
     /// Message receiver - cloneable without mutex thanks to flume
     pub(crate) message_rx: flume::Receiver<serde_json::Value>,
     /// Initialization result - set once during initialize(), read many times
     initialization_result: OnceLock<serde_json::Value>,
+    /// Set once the response reader task has exited, by any route.
+    ///
+    /// A request registered concurrently with that exit would otherwise miss
+    /// the reader's release sweep and wait forever, so registration re-checks
+    /// this flag and withdraws its own entry when the reader is already gone.
+    reader_has_exited: Arc<AtomicBool>,
 }
 
 impl QueryFull {
@@ -92,6 +150,7 @@ impl QueryFull {
             message_tx: Some(message_tx),
             message_rx,
             initialization_result: OnceLock::new(),
+            reader_has_exited: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -111,6 +170,7 @@ impl QueryFull {
             message_tx: Some(message_tx),
             message_rx,
             initialization_result: OnceLock::new(),
+            reader_has_exited: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -193,6 +253,7 @@ impl QueryFull {
         let sdk_mcp_servers = Arc::clone(&self.sdk_mcp_servers);
         let can_use_tool = self.can_use_tool.clone();
         let pending_responses = Arc::clone(&self.pending_responses);
+        let reader_has_exited = Arc::clone(&self.reader_has_exited);
         // Take ownership of message_tx
         let message_tx = self
             .message_tx
@@ -229,7 +290,10 @@ impl QueryFull {
                                     if let Some((_, tx)) =
                                         pending_responses.remove(&response.response.request_id)
                                     {
-                                        let _ = tx.send(response.response.data);
+                                        let _ = tx.send(RoutedControlResponse {
+                                            subtype: response.response.subtype,
+                                            data: response.response.data,
+                                        });
                                     }
                                 }
                             }
@@ -272,12 +336,16 @@ impl QueryFull {
                 }
             }
 
-            // Signal pending control requests on error
-            if stream_error.is_some() {
-                // Unblock all pending control requests by removing them
-                // (the oneshot channels will error when dropped)
-                pending_responses.clear();
-            }
+            // Release pending control requests on *every* reader exit, not only
+            // on error. A clean EOF ends this loop without setting
+            // `stream_error`, and a waiter whose sender is never dropped would
+            // otherwise block forever.
+            //
+            // Dropping each sender resolves its waiter with a receive error,
+            // which the interrupt path reports as an unavailable
+            // acknowledgement rather than as any claim about effect.
+            reader_has_exited.store(true, Ordering::SeqCst);
+            pending_responses.clear();
 
             // Send error sentinel if there was an error
             if let Some(ref error) = stream_error {
@@ -459,8 +527,16 @@ impl QueryFull {
         Ok(())
     }
 
-    /// Send control request to CLI
-    async fn send_control_request(&self, request: serde_json::Value) -> Result<serde_json::Value> {
+    /// Send a control request and hand back the correlated response with its
+    /// discriminator intact.
+    ///
+    /// The two failure modes are kept apart here so that each caller classifies
+    /// from a site where the distinction is still known, rather than
+    /// reconstructing it later from a rendered message.
+    async fn send_control_request_routed(
+        &self,
+        request: serde_json::Value,
+    ) -> std::result::Result<RoutedControlResponse, RoutedSendFailure> {
         let request_id = format!(
             "req_{}_{}",
             self.request_counter.fetch_add(1, Ordering::SeqCst),
@@ -471,6 +547,15 @@ impl QueryFull {
         let (tx, rx) = oneshot::channel();
         self.pending_responses.insert(request_id.clone(), tx);
 
+        // Close the registration race. The reader may have run its release
+        // sweep between exiting and this insertion, in which case nothing will
+        // ever resolve this waiter. Withdraw the entry instead of waiting
+        // forever.
+        if self.reader_has_exited.load(Ordering::SeqCst) {
+            self.pending_responses.remove(&request_id);
+            return Err(RoutedSendFailure::NoAcknowledgement);
+        }
+
         // Build and send request
         let control_request = json!({
             "type": "control_request",
@@ -478,18 +563,34 @@ impl QueryFull {
             "request": request
         });
 
-        let request_str = serde_json::to_string(&control_request)
-            .map_err(|e| ClaudeError::Transport(format!("Failed to serialize request: {}", e)))?;
-
-        // Write via transport - stdin/stdout have separate locks, no deadlock
-        self.transport.write(&request_str).await?;
-
-        // Wait for response
-        let response = rx.await.map_err(|_| {
-            ClaudeError::ControlProtocol("Control request response channel closed".to_string())
+        let request_str = serde_json::to_string(&control_request).map_err(|e| {
+            RoutedSendFailure::Write(ClaudeError::Transport(format!(
+                "Failed to serialize request: {}",
+                e
+            )))
         })?;
 
-        Ok(response)
+        // Write via transport - stdin/stdout have separate locks, no deadlock
+        self.transport
+            .write(&request_str)
+            .await
+            .map_err(RoutedSendFailure::Write)?;
+
+        // Wait for response
+        rx.await.map_err(|_| RoutedSendFailure::NoAcknowledgement)
+    }
+
+    /// Send control request to CLI
+    async fn send_control_request(&self, request: serde_json::Value) -> Result<serde_json::Value> {
+        self.send_control_request_routed(request)
+            .await
+            .map(|routed| routed.data)
+            .map_err(|failure| match failure {
+                RoutedSendFailure::Write(error) => error,
+                RoutedSendFailure::NoAcknowledgement => ClaudeError::ControlProtocol(
+                    "Control request response channel closed".to_string(),
+                ),
+            })
     }
 
     /// Receive messages
@@ -505,14 +606,49 @@ impl QueryFull {
         messages
     }
 
-    /// Send interrupt signal to Claude
-    pub async fn interrupt(&self) -> Result<()> {
+    /// Send an interrupt request to Claude Code and report its outcome.
+    ///
+    /// Returning `Ok` means Claude Code *accepted the request*. It does not mean
+    /// a turn stopped, and it does not mean a turn was running: an interrupt
+    /// sent during an active turn and one sent while nothing is running receive
+    /// the same success envelope. Evidence that a turn was actually interrupted
+    /// arrives separately, on the message stream.
+    pub(crate) async fn interrupt(
+        &self,
+    ) -> std::result::Result<InterruptRequestAccepted, InterruptQueryError> {
         let request = json!({
             "subtype": "interrupt"
         });
 
-        self.send_control_request(request).await?;
-        Ok(())
+        let routed = self
+            .send_control_request_routed(request)
+            .await
+            .map_err(|failure| match failure {
+                RoutedSendFailure::Write(source) => InterruptQueryError::SendFailed { source },
+                RoutedSendFailure::NoAcknowledgement => {
+                    InterruptQueryError::AcknowledgementUnavailable
+                }
+            })?;
+
+        // The fold is total over correlated responses: anything the
+        // deserializer admits but this match cannot interpret is reported as
+        // unusable rather than as acceptance or as a failure to deliver.
+        match routed.subtype.as_str() {
+            "success" => Ok(InterruptRequestAccepted {
+                still_queued: parse_still_queued(&routed.data),
+            }),
+            "error" => match routed.data.get("error").and_then(|value| value.as_str()) {
+                Some(message) => Err(InterruptQueryError::ErrorResponse {
+                    message: message.to_string(),
+                }),
+                None => Err(InterruptQueryError::UnexpectedResponse {
+                    subtype: routed.subtype,
+                }),
+            },
+            _ => Err(InterruptQueryError::UnexpectedResponse {
+                subtype: routed.subtype,
+            }),
+        }
     }
 
     /// Change permission mode dynamically

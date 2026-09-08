@@ -310,8 +310,9 @@ drop(stream); // Important: drop stream before next query
 ### Dynamic Control
 
 ```rust
-// Interrupt current execution
-client.interrupt().await?;
+// Request an interrupt. Returns InterruptRequestAccepted, which means the
+// request was accepted, not that a turn stopped or that one was running.
+let accepted = client.interrupt().await?;
 
 // Change permission mode mid-execution
 client.set_permission_mode(PermissionMode::Plan).await?;

@@ -484,8 +484,8 @@ client.query_with_session("Different context", "session-2").await?;
 client.new_session("session-3", "Fresh start").await?;
 
 // Dynamic control (mid-execution)
-client.interrupt().await?;  // Stop current operation
-// Client will handle the interrupt automatically
+let accepted = client.interrupt().await?;  // Request an interrupt
+// Acceptance is not a stop: watch the message stream for the interrupt marker
 
 // Disconnect
 client.disconnect().await?;
