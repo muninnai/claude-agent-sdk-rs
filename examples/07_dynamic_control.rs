@@ -102,7 +102,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let mut stream = client.receive_response();
-    let mut interrupted = false;
+    // Whether Claude Code *accepted an interrupt request*. It is deliberately
+    // not named `interrupted`: an acceptance is not a stop, and an interrupt
+    // sent while nothing is running is accepted just the same. Evidence that a
+    // turn was actually interrupted arrives separately, on the message stream.
+    let mut interrupt_requested = false;
 
     // Process messages and check for interrupt
     loop {
@@ -120,9 +124,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             Message::Result(result) => {
                                 println!(
-                                    "\n[Result] Duration: {}ms, Interrupted: {}\n",
+                                    "\n[Result] Duration: {}ms, Interrupt requested: {}\n",
                                     result.duration_ms,
-                                    interrupted
+                                    interrupt_requested
                                 );
                                 break;
                             }
@@ -136,13 +140,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None => break,
                 }
             }
-            _ = &mut interrupt_task, if !interrupted => {
+            _ = &mut interrupt_task, if !interrupt_requested => {
                 println!("\nSending interrupt signal...");
                 match client.interrupt().await {
                     Err(e) => eprintln!("No interrupt acknowledgement: {}", e),
                     Ok(_) => {
                         println!("Interrupt request accepted!");
-                        interrupted = true;
+                        interrupt_requested = true;
                     }
                 }
             }
