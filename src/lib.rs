@@ -248,6 +248,7 @@ pub use types::{
     config::*,
     efficiency::{EfficiencyConfig, ExecutionMetrics, MetricsSummary},
     hooks::*,
+    interrupt::{InterruptError, InterruptRequestAccepted},
     mcp::{
         McpServerConfig, McpServers, SdkMcpServer, SdkMcpTool, ToolHandler, ToolResult,
         ToolResultContent as McpToolResultContent, create_sdk_mcp_server,

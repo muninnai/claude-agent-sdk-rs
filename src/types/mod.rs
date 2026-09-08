@@ -3,6 +3,7 @@
 pub mod config;
 pub mod efficiency;
 pub mod hooks;
+pub mod interrupt;
 pub mod mcp;
 pub mod messages;
 pub mod permissions;
