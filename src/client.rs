@@ -702,13 +702,8 @@ impl ClaudeClient {
     /// response reader exited before answering, or a correlated response
     /// arrived that could not be interpreted. No variant claims that a turn was
     /// or was not stopped.
-    pub async fn interrupt(
-        &self,
-    ) -> std::result::Result<InterruptRequestAccepted, InterruptError> {
-        let query = self
-            .query
-            .as_ref()
-            .ok_or(InterruptError::NotConnected)?;
+    pub async fn interrupt(&self) -> std::result::Result<InterruptRequestAccepted, InterruptError> {
+        let query = self.query.as_ref().ok_or(InterruptError::NotConnected)?;
 
         query.interrupt().await.map_err(|error| match error {
             InterruptQueryError::SendFailed { source } => InterruptError::SendFailed { source },

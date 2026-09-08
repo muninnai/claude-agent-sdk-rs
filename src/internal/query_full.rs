@@ -11,8 +11,8 @@ use tokio::sync::oneshot;
 
 use crate::errors::{ClaudeError, Result};
 use crate::types::hooks::{HookCallback, HookContext, HookInput, HookMatcher};
-use crate::types::mcp::McpSdkServerConfig;
 use crate::types::interrupt::InterruptRequestAccepted;
+use crate::types::mcp::McpSdkServerConfig;
 use crate::types::permissions::{CanUseToolCallback, PermissionResult, ToolPermissionContext};
 
 use super::transport::Transport;
