@@ -395,8 +395,8 @@ async fn example_control_protocol() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n[Sending interrupt after 2 seconds...]");
 
     match client.interrupt().await {
-        Ok(_) => println!("✓ Interrupt sent successfully"),
-        Err(e) => println!("✗ Interrupt failed: {}", e),
+        Ok(_) => println!("✓ Interrupt request accepted"),
+        Err(e) => println!("✗ No interrupt acknowledgement: {}", e),
     }
 
     // Wait for interrupt to process

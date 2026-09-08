@@ -1,7 +1,7 @@
 //! Example demonstrating dynamic control methods of ClaudeClient
 //!
 //! This example shows how to use the dynamic control methods:
-//! - interrupt() - Stop Claude mid-execution
+//! - interrupt() - Request an interrupt mid-execution (acceptance is not a stop)
 //! - set_permission_mode() - Change permission mode on the fly
 //! - set_model() - Switch AI models during the session
 //!
@@ -138,11 +138,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ = &mut interrupt_task, if !interrupted => {
                 println!("\nSending interrupt signal...");
-                if let Err(e) = client.interrupt().await {
-                    eprintln!("Failed to interrupt: {}", e);
-                } else {
-                    println!("Interrupt sent!");
-                    interrupted = true;
+                match client.interrupt().await {
+                    Err(e) => eprintln!("No interrupt acknowledgement: {}", e),
+                    Ok(_) => {
+                        println!("Interrupt request accepted!");
+                        interrupted = true;
+                    }
                 }
             }
         }

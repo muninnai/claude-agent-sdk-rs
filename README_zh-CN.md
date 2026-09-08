@@ -484,8 +484,8 @@ client.query_with_session("不同上下文", "session-2").await?;
 client.new_session("session-3", "全新开始").await?;
 
 // 动态控制（执行中）
-client.interrupt().await?;  // 停止当前操作
-// 客户端会自动处理中断
+let accepted = client.interrupt().await?;  // 请求中断
+// 接受请求不等于已停止：请在消息流中查看中断标记
 
 // 断开连接
 client.disconnect().await?;
