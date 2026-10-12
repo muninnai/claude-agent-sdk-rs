@@ -1,25 +1,37 @@
 {
   description = "Claude Agent SDK Rust development environment";
 
-  # Pinned to the same nixpkgs revision as token-vault's dev shell, so the toolchain
-  # comes from the binary cache.
+  # Keep cached build dependencies on this pin; its Rust compiler is 1.98.1.
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/c7def046b9a883d46974757852106483d741586f";
+  inputs.fenix = {
+    url = "github:nix-community/fenix/329aea43982331f709ab302bbba51b024c5769e2";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
 
   outputs =
-    { nixpkgs, ... }:
+    { nixpkgs, fenix, ... }:
     let
       systems = [ "x86_64-linux" ];
-      forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      rustToolchainFor = system: fenix.packages.${system}.fromToolchainName {
+        name = "1.99.0";
+        sha256 = "sha256-zm3dyIY2T414ZRR3EhLOvptzG6gta4WZUcawzMUWtqI=";
+      };
+      forAll = f:
+        nixpkgs.lib.genAttrs systems (system:
+          f nixpkgs.legacyPackages.${system} (rustToolchainFor system));
     in
     {
-      devShells = forAll (pkgs: {
+      devShells = forAll (pkgs: rustToolchain: {
         default = pkgs.mkShell {
           packages = [
-            pkgs.cargo
-            pkgs.rustc
-            pkgs.clippy
-            pkgs.rustfmt
-            pkgs.rust-analyzer
+            (rustToolchain.withComponents [
+              "cargo"
+              "rustc"
+              "rust-std"
+              "clippy"
+              "rustfmt"
+              "rust-analyzer"
+            ])
           ];
           shellHook = ''
             # Put Rust build output on the non-snapshotted cache dataset. The canonical
