@@ -399,10 +399,13 @@ async fn example_control_protocol() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => println!("✗ No interrupt acknowledgement: {}", e),
     }
 
-    // Wait for interrupt to process
+    // Pause before the next query. The acknowledgement above says the request
+    // was accepted, not that anything stopped, so there is no effect to wait
+    // on here — if a turn was running, its interruption shows up on the
+    // message stream rather than in this sleep.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Send new query after interrupt
+    // Send a new query after the interrupt request
     println!("\nUser: Just say 'Hello!'");
     client.query("Just say 'Hello!'").await?;
 
