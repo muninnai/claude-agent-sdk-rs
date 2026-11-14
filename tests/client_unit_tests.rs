@@ -722,30 +722,29 @@ fn spawn_permission_mode_response_watcher(
         let mut seen = 0;
         loop {
             let written = transport.written_messages_async().await;
-            for i in seen..written.len() {
-                if let Some(ref parsed) = written[i].parsed {
-                    if parsed.get("type").and_then(|v| v.as_str()) == Some("control_request")
-                        && parsed.pointer("/request/subtype").and_then(|v| v.as_str())
-                            == Some("set_permission_mode")
-                    {
-                        let request_id = parsed["request_id"].as_str().unwrap();
-                        let mut response = serde_json::json!({
-                            "type": "control_response",
-                            "response": {
-                                "subtype": "set_permission_mode",
-                                "request_id": request_id,
-                            }
-                        });
-                        if let Some(resp_obj) = response["response"].as_object_mut() {
-                            if let Some(body_obj) = response_fields.as_object() {
-                                for (k, v) in body_obj {
-                                    resp_obj.insert(k.clone(), v.clone());
-                                }
-                            }
+            for message in written.iter().skip(seen) {
+                if let Some(ref parsed) = message.parsed
+                    && parsed.get("type").and_then(|v| v.as_str()) == Some("control_request")
+                    && parsed.pointer("/request/subtype").and_then(|v| v.as_str())
+                        == Some("set_permission_mode")
+                {
+                    let request_id = parsed["request_id"].as_str().unwrap();
+                    let mut response = serde_json::json!({
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "set_permission_mode",
+                            "request_id": request_id,
                         }
-                        transport.inject(response);
-                        return;
+                    });
+                    if let Some(resp_obj) = response["response"].as_object_mut()
+                        && let Some(body_obj) = response_fields.as_object()
+                    {
+                        for (k, v) in body_obj {
+                            resp_obj.insert(k.clone(), v.clone());
+                        }
                     }
+                    transport.inject(response);
+                    return;
                 }
             }
             seen = written.len();
@@ -892,29 +891,28 @@ fn spawn_interrupt_response_watcher(
         let mut seen = 0;
         loop {
             let written = transport.written_messages_async().await;
-            for i in seen..written.len() {
-                if let Some(ref parsed) = written[i].parsed {
-                    if parsed.get("type").and_then(|v| v.as_str()) == Some("control_request")
-                        && parsed.pointer("/request/subtype").and_then(|v| v.as_str())
-                            == Some("interrupt")
-                    {
-                        let request_id = parsed["request_id"].as_str().unwrap();
-                        let mut response = serde_json::json!({
-                            "type": "control_response",
-                            "response": {
-                                "request_id": request_id,
-                            }
-                        });
-                        if let Some(resp_obj) = response["response"].as_object_mut() {
-                            if let Some(body_obj) = envelope_fields.as_object() {
-                                for (k, v) in body_obj {
-                                    resp_obj.insert(k.clone(), v.clone());
-                                }
-                            }
+            for message in written.iter().skip(seen) {
+                if let Some(ref parsed) = message.parsed
+                    && parsed.get("type").and_then(|v| v.as_str()) == Some("control_request")
+                    && parsed.pointer("/request/subtype").and_then(|v| v.as_str())
+                        == Some("interrupt")
+                {
+                    let request_id = parsed["request_id"].as_str().unwrap();
+                    let mut response = serde_json::json!({
+                        "type": "control_response",
+                        "response": {
+                            "request_id": request_id,
                         }
-                        transport.inject(response);
-                        return;
+                    });
+                    if let Some(resp_obj) = response["response"].as_object_mut()
+                        && let Some(body_obj) = envelope_fields.as_object()
+                    {
+                        for (k, v) in body_obj {
+                            resp_obj.insert(k.clone(), v.clone());
+                        }
                     }
+                    transport.inject(response);
+                    return;
                 }
             }
             seen = written.len();
