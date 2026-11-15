@@ -1,12 +1,15 @@
 {
   description = "Claude Agent SDK Rust development environment";
 
-  # Pinned to the same nixpkgs revision as token-vault's dev shell, so the toolchain
-  # comes from the binary cache.
+  # Keep the existing dependency and build environment pin.
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/c7def046b9a883d46974757852106483d741586f";
+  inputs.fenix = {
+    url = "github:nix-community/fenix/9e77b652ca4af1d2e5d9ad4f5a910e48d8c79085";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
 
   outputs =
-    { nixpkgs, ... }:
+    { nixpkgs, fenix, ... }:
     let
       systems = [ "x86_64-linux" ];
       forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
@@ -15,12 +18,14 @@
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {
           packages = [
-            pkgs.cargo
-            pkgs.rustc
-            pkgs.clippy
-            pkgs.rustfmt
+            (fenix.packages.${pkgs.stdenv.hostPlatform.system}.fromToolchainFile {
+              file = ./rust-toolchain.toml;
+              sha256 = "sha256-MFHoWVcPZKjFrLnQnodCXbUsfZcofGfo9tV9fTTvklg=";
+            })
             pkgs.rust-analyzer
           ];
+          CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE = "14 days";
+          CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE = "deny";
           shellHook = ''
             # Put Rust build output on the non-snapshotted cache dataset. The canonical
             # path keeps sibling JJ workspaces with the same basename apart.
